@@ -84,6 +84,16 @@ public:
         return pushed_down_filters;
     }
 
+    Strings getUris() const
+    {
+        return uris;
+    }
+
+    Strings getNames() const
+    {
+        return col_names;
+    }
+
 private:
     const tipb::Executor * table_scan;
     String executor_id;
@@ -108,6 +118,9 @@ private:
     bool is_fast_scan;
     std::vector<Int32> runtime_filter_ids;
     int max_wait_time_ms;
+
+    Strings uris;
+    Strings col_names;
 };
 
 } // namespace DB

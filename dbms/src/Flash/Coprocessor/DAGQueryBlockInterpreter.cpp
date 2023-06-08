@@ -50,6 +50,11 @@
 #include <Parsers/ASTSelectQuery.h>
 #include <Storages/Transaction/TMTContext.h>
 
+#include <utility>
+
+#include "Flash/Coprocessor/StorageFederationInterpreter.h"
+#include "common/logger_useful.h"
+
 namespace DB
 {
 namespace FailPoints
@@ -200,19 +205,28 @@ void DAGQueryBlockInterpreter::handleMockTableScan(const TiDBTableScan & table_s
 void DAGQueryBlockInterpreter::handleTableScan(const TiDBTableScan & table_scan, DAGPipeline & pipeline)
 {
     const auto filter_conditions = FilterConditions::filterConditionsFrom(query_block.selection_name, query_block.selection);
-
-    if (context.getSharedContextDisagg()->isDisaggregatedComputeMode())
+    int is_federetion = !table_scan.getUris().empty();
+    if (!is_federetion)
     {
-        StorageDisaggregatedInterpreter disaggregated_tiflash_interpreter(context, table_scan, filter_conditions, max_streams);
-        disaggregated_tiflash_interpreter.execute(pipeline);
-        analyzer = std::move(disaggregated_tiflash_interpreter.analyzer);
+        if (context.getSharedContextDisagg()->isDisaggregatedComputeMode())
+        {
+            StorageDisaggregatedInterpreter disaggregated_tiflash_interpreter(context, table_scan, filter_conditions, max_streams);
+            disaggregated_tiflash_interpreter.execute(pipeline);
+            analyzer = std::move(disaggregated_tiflash_interpreter.analyzer);
+        }
+        else
+        {
+            DAGStorageInterpreter storage_interpreter(context, table_scan, filter_conditions, max_streams);
+            storage_interpreter.execute(pipeline);
+
+            analyzer = std::move(storage_interpreter.analyzer);
+        }
     }
     else
     {
-        DAGStorageInterpreter storage_interpreter(context, table_scan, filter_conditions, max_streams);
-        storage_interpreter.execute(pipeline);
-
-        analyzer = std::move(storage_interpreter.analyzer);
+        StorageFederationIterpreter storate_interpreter(context, table_scan, filter_conditions, max_streams);
+        storate_interpreter.execute(pipeline);
+        analyzer = std::move(storate_interpreter.analyzer);
     }
 }
 

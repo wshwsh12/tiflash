@@ -72,6 +72,18 @@ TiDBTableScan::TiDBTableScan(
         else
             throw TiFlashException("table scan without table id.", Errors::Coprocessor::BadRequest);
         physical_table_ids.push_back(logical_table_id);
+        if (!table_scan->tbl_scan().hdfs_uri().empty())
+        {
+            for (const auto & uri : table_scan->tbl_scan().hdfs_uri())
+            {
+                uris.push_back(uri);
+            }
+            for (const auto & col : table_scan->tbl_scan().columns())
+            {
+                std::cout << col.name() << " " << col.tp() << std::endl;
+                col_names.push_back(col.name());
+            }
+        }
     }
 }
 void TiDBTableScan::constructTableScanForRemoteRead(tipb::TableScan * tipb_table_scan, TableID table_id) const

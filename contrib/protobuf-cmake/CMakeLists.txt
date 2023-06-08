@@ -6,6 +6,7 @@ add_definitions(-DGOOGLE_PROTOBUF_CMAKE_BUILD)
 
 add_definitions(-DHAVE_PTHREAD)
 add_definitions(-DHAVE_ZLIB)
+add_compile_options(-fPIC)
 
 include_directories(
   ${ZLIB_INCLUDE_DIRECTORIES}

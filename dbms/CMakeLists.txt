@@ -194,6 +194,9 @@ target_link_libraries (dbms
     ${BTRIE_LIBRARIES}
     absl::synchronization
     tiflash_contrib::aws_s3
+    tiflash_contrib::arrow
+    tiflash_contrib::parquet
+    tiflash_contrib::hdfs
 
     etcdpb
     tiflash_parsers
