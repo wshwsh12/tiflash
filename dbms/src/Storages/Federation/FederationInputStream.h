@@ -46,6 +46,7 @@
 #include "Common/Logger.h"
 #include "Common/assert_cast.h"
 #include "Core/ColumnsWithTypeAndName.h"
+#include "DataTypes/DataTypeDecimal.h"
 #include "DataTypes/DataTypeString.h"
 #include "DataTypes/DataTypesNumber.h"
 #include "Storages/Federation/ArrowBufferedStreams.h"
@@ -147,6 +148,10 @@ private:
         return readColumnWithNumericData<CPP_NUMERIC_TYPE>(arrow_column, column_name);
             FOR_ARROW_NUMERIC_TYPES(DISPATCH)
 #undef DISPATCH
+        case arrow::Type::DECIMAL128:
+            return readColumnWithDecimalData<arrow::Decimal128Array>(arrow_column, column_name);
+        case arrow::Type::DECIMAL256:
+            return readColumnWithDecimalData<arrow::Decimal256Array>(arrow_column, column_name);
         default:
             throw Exception("???");
         }
@@ -218,6 +223,40 @@ private:
             }
         }
         return {std::move(internal_column), std::move(internal_type), column_name};
+    }
+
+    template <typename DecimalType, typename DecimalArray>
+    static ColumnWithTypeAndName readColumnWithDecimalDataImpl(std::shared_ptr<arrow::ChunkedArray> & arrow_column, const String & column_name, DataTypePtr internal_type)
+    {
+        auto internal_column = internal_type->createColumn();
+        auto & column = assert_cast<ColumnDecimal<DecimalType> &>(*internal_column);
+        auto & column_data = column.getData();
+        column_data.reserve(arrow_column->length());
+
+        for (int chunk_i = 0, num_chunks = arrow_column->num_chunks(); chunk_i < num_chunks; ++chunk_i)
+        {
+            auto & chunk = dynamic_cast<DecimalArray &>(*(arrow_column->chunk(chunk_i)));
+            for (size_t value_i = 0, length = static_cast<size_t>(chunk.length()); value_i < length; ++value_i)
+            {
+                column_data.emplace_back(chunk.IsNull(value_i) ? DecimalType(0) : *reinterpret_cast<const DecimalType *>(chunk.Value(value_i))); // TODO: copy column
+            }
+        }
+        return {std::move(internal_column), internal_type, column_name};
+    }
+
+    template <typename DecimalArray>
+    static ColumnWithTypeAndName readColumnWithDecimalData(std::shared_ptr<arrow::ChunkedArray> & arrow_column, const String & column_name)
+    {
+        const auto * arrow_decimal_type = static_cast<arrow::DecimalType *>(arrow_column->type().get());
+        size_t precision = arrow_decimal_type->precision();
+        auto internal_type = createDecimal(precision, arrow_decimal_type->scale());
+        if (precision <= 9)
+            return readColumnWithDecimalDataImpl<Decimal32, DecimalArray>(arrow_column, column_name, internal_type);
+        else if (precision <= 18)
+            return readColumnWithDecimalDataImpl<Decimal64, DecimalArray>(arrow_column, column_name, internal_type);
+        else if (precision <= 38)
+            return readColumnWithDecimalDataImpl<Decimal128, DecimalArray>(arrow_column, column_name, internal_type);
+        return readColumnWithDecimalDataImpl<Decimal256, DecimalArray>(arrow_column, column_name, internal_type);
     }
 
     static void checkStatus(const arrow::Status & status)
