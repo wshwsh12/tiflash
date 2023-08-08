@@ -17,6 +17,8 @@
 #include <Core/Block.h>
 #include <DataStreams/IBlockInputStream.h>
 #include <DataStreams/IProfilingBlockInputStream.h>
+#include <DataTypes/DataTypeDate.h>
+#include <DataTypes/DataTypeDateTime.h>
 #include <arrow/api.h>
 #include <arrow/chunked_array.h>
 #include <arrow/filesystem/hdfs.h>
@@ -71,13 +73,18 @@ public:
         , file_type(file_type_)
         , log(log_)
     {
+        LOG_DEBUG(log, uri_);
+        LOG_DEBUG(log, "make_shared HDFSFileHandler");
         auto hdfs_file = std::make_shared<HDFSFileHandler>(uri);
         std::unique_ptr<parquet::arrow::FileReader> reader;
+        LOG_DEBUG(log, "hdfs_file -> arrow");
         PARQUET_THROW_NOT_OK(
             parquet::arrow::OpenFile(hdfs_file->asArrowFile(), arrow::default_memory_pool(), &reader));
+        LOG_DEBUG(log, "arrow -> table");
         PARQUET_THROW_NOT_OK(reader->ReadTable(&table));
+        LOG_DEBUG(log, "table -> schema");
         header = arrowSchemaToCHHeader(*table->schema());
-        //   LOG_DEBUG(log, file_name + file_type);
+        LOG_DEBUG(log, uri_);
         //   std::shared_ptr<arrow::io::ReadableFile> infile;
         //   PARQUET_ASSIGN_OR_THROW(
         //       infile,
@@ -152,8 +159,12 @@ private:
             return readColumnWithDecimalData<arrow::Decimal128Array>(arrow_column, column_name);
         case arrow::Type::DECIMAL256:
             return readColumnWithDecimalData<arrow::Decimal256Array>(arrow_column, column_name);
+        case arrow::Type::DATE32:
+            return readColumnWithDate32Data(arrow_column, column_name);
+        case arrow::Type::DATE64:
+            return readColumnWithDate64Data(arrow_column, column_name);
         default:
-            throw Exception("???");
+            throw Exception("Unsupport arrow type " + arrow_column->type()->ToString());
         }
         return {};
     }
@@ -257,6 +268,46 @@ private:
         else if (precision <= 38)
             return readColumnWithDecimalDataImpl<Decimal128, DecimalArray>(arrow_column, column_name, internal_type);
         return readColumnWithDecimalDataImpl<Decimal256, DecimalArray>(arrow_column, column_name, internal_type);
+    }
+
+    static ColumnWithTypeAndName readColumnWithDate32Data(std::shared_ptr<arrow::ChunkedArray> & arrow_column, const String & column_name)
+    {
+        DataTypePtr internal_type;
+        /// Make result type Date32 when requested type is actually Date32 or when we use schema inference
+        internal_type = std::make_shared<DataTypeInt32>();
+
+        auto internal_column = internal_type->createColumn();
+        PaddedPODArray<Int32> & column_data = assert_cast<ColumnVector<Int32> &>(*internal_column).getData();
+        column_data.reserve(arrow_column->length());
+
+        for (int chunk_i = 0, num_chunks = arrow_column->num_chunks(); chunk_i < num_chunks; ++chunk_i)
+        {
+            arrow::Date32Array & chunk = dynamic_cast<arrow::Date32Array &>(*(arrow_column->chunk(chunk_i)));
+
+            std::shared_ptr<arrow::Buffer> buffer = chunk.data()->buffers[1];
+            const auto * raw_data = reinterpret_cast<const Int32 *>(buffer->data()) + chunk.offset();
+            column_data.insert_assume_reserved(raw_data, raw_data + chunk.length());
+        }
+        return {std::move(internal_column), internal_type, column_name};
+    }
+
+    static ColumnWithTypeAndName readColumnWithDate64Data(std::shared_ptr<arrow::ChunkedArray> & arrow_column, const String & column_name)
+    {
+        auto internal_type = std::make_shared<DataTypeDateTime>();
+        auto internal_column = internal_type->createColumn();
+        auto & column_data = assert_cast<ColumnVector<UInt32> &>(*internal_column).getData();
+        column_data.reserve(arrow_column->length());
+
+        for (int chunk_i = 0, num_chunks = arrow_column->num_chunks(); chunk_i < num_chunks; ++chunk_i)
+        {
+            auto & chunk = dynamic_cast<arrow::Date64Array &>(*(arrow_column->chunk(chunk_i)));
+            for (size_t value_i = 0, length = static_cast<size_t>(chunk.length()); value_i < length; ++value_i)
+            {
+                auto timestamp = static_cast<UInt32>(chunk.Value(value_i) / 1000); // Always? in ms
+                column_data.emplace_back(timestamp);
+            }
+        }
+        return {std::move(internal_column), std::move(internal_type), column_name};
     }
 
     static void checkStatus(const arrow::Status & status)
