@@ -31,6 +31,8 @@
 #include <fmt/os.h>
 #include <tici-search-lib/src/lib.rs.h>
 
+#include <optional>
+
 namespace DB::TS
 {
 
@@ -51,6 +53,7 @@ class TantivyInputStream : public IProfilingBlockInputStream
     static constexpr auto NAME = "TantivyInputStream";
 
     static constexpr auto version_column_name = "column_-1024";
+    static constexpr size_t stream_batch_rows = 1024;
 
 public:
     TantivyInputStream(
@@ -92,53 +95,70 @@ public:
         {
             return {};
         }
-        Block ret = readFromS3(is_count);
-        done = true;
-        return ret;
+        while (!done)
+        {
+            Block ret = readFromS3(is_count);
+            if (ret)
+            {
+                return ret;
+            }
+        }
+        return {};
     }
 
 protected:
     Block readFromS3(bool is_count)
     {
-        auto return_fields = getFields(return_columns);
-        auto shard_info = query_shard_info;
-        LOG_DEBUG(log, "shard info: {}", shard_info.toString());
-        auto key_ranges = getKeyRanges(shard_info.key_ranges);
-
-        rust::Vec<rust::String> tici_sort_column_names;
-        for (const auto & sort_column_id : sort_column_ids)
+        if (!search_stream.has_value())
         {
-            tici_sort_column_names.push_back(rust::String("column_" + std::to_string(sort_column_id)));
-        }
-        rust::Vec<bool> tici_sort_column_asc;
-        for (const auto & asc : sort_column_asc)
-        {
-            tici_sort_column_asc.push_back(asc);
-        }
+            auto return_fields = getFields(return_columns);
+            auto shard_info = query_shard_info;
+            LOG_DEBUG(log, "shard info: {}", shard_info.toString());
+            auto key_ranges = getKeyRanges(shard_info.key_ranges);
 
-        SearchParam search_param{
-            .limit = static_cast<size_t>(limit),
-            .sort_field_names = std::move(tici_sort_column_names),
-            .is_asc = std::move(tici_sort_column_asc),
-        };
-        if (is_count)
-            return_fields = {};
-
-        RUNTIME_CHECK(shards_snapshot != nullptr);
-        SearchResult search_result = search(
-            **shards_snapshot,
+            rust::Vec<rust::String> tici_sort_column_names;
+            for (const auto & sort_column_id : sort_column_ids)
             {
-                .keyspace_id = keyspace_id,
-                .table_id = table_id,
-                .index_id = index_id,
-                .shard_id = shard_info.shard_id,
-                .shard_epoch = shard_info.shard_epoch,
-            },
-            key_ranges,
-            return_fields,
-            match_expr,
-            search_param,
-            read_ts);
+                tici_sort_column_names.push_back(rust::String("column_" + std::to_string(sort_column_id)));
+            }
+            rust::Vec<bool> tici_sort_column_asc;
+            for (const auto & asc : sort_column_asc)
+            {
+                tici_sort_column_asc.push_back(asc);
+            }
+
+            SearchParam search_param{
+                .limit = static_cast<size_t>(limit),
+                .sort_field_names = std::move(tici_sort_column_names),
+                .is_asc = std::move(tici_sort_column_asc),
+            };
+            if (is_count)
+                return_fields = {};
+
+            RUNTIME_CHECK(shards_snapshot != nullptr);
+            search_stream.emplace(search_open(
+                **shards_snapshot,
+                {
+                    .keyspace_id = keyspace_id,
+                    .table_id = table_id,
+                    .index_id = index_id,
+                    .shard_id = shard_info.shard_id,
+                    .shard_epoch = shard_info.shard_epoch,
+                },
+                key_ranges,
+                return_fields,
+                match_expr,
+                search_param,
+                read_ts));
+        }
+
+        RUNTIME_CHECK(search_stream.has_value());
+        SearchResult search_result = search_next(**search_stream, stream_batch_rows);
+        if (search_result.eof)
+        {
+            done = true;
+            search_stream.reset();
+        }
 
         Block res(return_columns);
         if (is_count)
@@ -263,6 +283,7 @@ private:
     ::Expr match_expr;
     bool is_count;
     std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot;
+    std::optional<rust::Box<SearchStream>> search_stream;
 
     static rust::Vec<rust::String> getFields(NamesAndTypes & columns)
     {
