@@ -51,6 +51,13 @@ class TantivyInputStream : public IProfilingBlockInputStream
     static constexpr auto NAME = "TantivyInputStream";
 
     static constexpr auto version_column_name = "column_-1024";
+    static constexpr auto virtual_score_column_name = "column_-2050";
+    static constexpr auto score_column_name = "_INTERNAL_FTS_SCORE";
+
+    static bool isScoreColumnName(std::string_view name)
+    {
+        return name == score_column_name || name == virtual_score_column_name;
+    }
 
 public:
     TantivyInputStream(
@@ -64,7 +71,8 @@ public:
         std::vector<Int64> sort_column_ids_,
         std::vector<bool> sort_column_asc_,
         UInt64 read_ts_,
-        ::Expr match_expr_,
+        ::SearchQuery search_query_,
+        bool with_score_,
         bool is_count,
         std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot_)
         : log(log_)
@@ -77,7 +85,8 @@ public:
         , sort_column_ids(sort_column_ids_)
         , sort_column_asc(sort_column_asc_)
         , read_ts(read_ts_)
-        , match_expr(match_expr_)
+        , search_query(search_query_)
+        , with_score(with_score_)
         , is_count(is_count)
         , shards_snapshot(std::move(shards_snapshot_))
     {}
@@ -120,6 +129,7 @@ protected:
             .limit = static_cast<size_t>(limit),
             .sort_field_names = std::move(tici_sort_column_names),
             .is_asc = std::move(tici_sort_column_asc),
+            .with_score = with_score && !is_count,
         };
         if (is_count)
             return_fields = {};
@@ -136,7 +146,7 @@ protected:
             },
             key_ranges,
             return_fields,
-            match_expr,
+            search_query,
             search_param,
             read_ts);
 
@@ -173,6 +183,15 @@ protected:
                     for (auto & doc : documents)
                     {
                         col->insert(Field(doc.version));
+                    }
+                    continue;
+                }
+                if (isScoreColumnName(name_and_type.name))
+                {
+                    auto col = res.getByName(name_and_type.name).column->assumeMutable();
+                    for (auto & doc : documents)
+                    {
+                        col->insert(Field(static_cast<Float64>(doc.score)));
                     }
                     continue;
                 }
@@ -219,6 +238,22 @@ protected:
                     }
                 }
             }
+            if (removeNullable(name_and_type.type)->isNumber() && !removeNullable(name_and_type.type)->isInteger())
+            {
+                for (auto & doc : documents)
+                {
+                    const auto & field_value = doc.fieldValues[idx];
+                    if (field_value.is_null)
+                    {
+                        has_null = true;
+                        col->insert(Field());
+                    }
+                    else
+                    {
+                        col->insert(Field(static_cast<Float64>(field_value.float_value)));
+                    }
+                }
+            }
             if (removeNullable(name_and_type.type)->isDateOrDateTime())
             {
                 for (auto & doc : documents)
@@ -260,7 +295,8 @@ private:
     std::vector<Int64> sort_column_ids;
     std::vector<bool> sort_column_asc;
     UInt64 read_ts;
-    ::Expr match_expr;
+    ::SearchQuery search_query;
+    bool with_score;
     bool is_count;
     std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot;
 

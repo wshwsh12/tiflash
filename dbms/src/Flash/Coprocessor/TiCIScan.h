@@ -37,6 +37,7 @@ public:
     const int & getIndexId() const { return index_id; }
     const int & getLimit() const { return limit; }
     const tipb::Executor * getTiCIScan() const { return tici_scan; }
+    const tipb::FTSQueryInfo & getFTSQueryInfo() const { return tici_scan->idx_scan().fts_query_info(); }
 
     void constructTiCIScanForRemoteRead(tipb::IndexScan * tipb_index_scan) const;
 

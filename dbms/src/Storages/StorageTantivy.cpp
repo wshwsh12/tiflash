@@ -96,7 +96,7 @@ void StorageTantivy::read(
         tici_scan.getSortColumnIds(),
         tici_scan.getSortColumnAsc(),
         context.getSettingsRef().read_tso,
-        tici_scan.getMatchExpr(),
+        tici_scan.getFTSQueryInfo(),
         tici_scan.isCount(),
         context.getTimezoneInfo(),
         std::move(shards_snapshot));

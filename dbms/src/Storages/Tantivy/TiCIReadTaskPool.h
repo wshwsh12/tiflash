@@ -38,7 +38,8 @@ public:
         std::vector<Int64> sort_column_ids_,
         std::vector<bool> sort_column_asc_,
         UInt64 read_ts_,
-        ::Expr match_expr_,
+        ::SearchQuery search_query_,
+        bool with_score_,
         bool is_count,
         const std::shared_ptr<rust::Box<ShardsSnapshot>> & shards_snapshot_)
     {
@@ -53,7 +54,8 @@ public:
             sort_column_ids_,
             sort_column_asc_,
             read_ts_,
-            match_expr_,
+            search_query_,
+            with_score_,
             is_count,
             shards_snapshot_);
     }
@@ -74,6 +76,50 @@ private:
 
 using TiCIReadTaskPtr = std::shared_ptr<TiCIReadTask>;
 
+inline void appendTiCIBooleanNodesToFFI(
+    const tipb::FTSBooleanQuery & boolean_query,
+    rust::Vec<::BooleanQueryNode> & nodes)
+{
+    static constexpr Int32 subexpression_term_type = 3;
+    struct DeferredSubExpression
+    {
+        size_t node_idx;
+        const tipb::FTSBooleanQuery * query;
+    };
+
+    std::vector<DeferredSubExpression> deferred_subexpressions;
+    deferred_subexpressions.reserve(boolean_query.nodes_size());
+
+    for (const auto & node : boolean_query.nodes())
+    {
+        ::BooleanQueryNode ffi_node;
+        ffi_node.occur = static_cast<Int32>(node.occur());
+        ffi_node.modifier = static_cast<Int32>(node.modifier());
+        ffi_node.child_start = 0;
+        ffi_node.child_len = 0;
+        if (node.has_term())
+        {
+            ffi_node.term_type = static_cast<Int32>(node.term().term_type());
+            for (const auto ch : node.term().text())
+                ffi_node.text.push_back(static_cast<uint8_t>(ch));
+            nodes.push_back(std::move(ffi_node));
+            continue;
+        }
+        RUNTIME_CHECK(node.has_sub_expression());
+        ffi_node.term_type = subexpression_term_type;
+        nodes.push_back(std::move(ffi_node));
+        deferred_subexpressions.push_back(DeferredSubExpression{nodes.size() - 1, &node.sub_expression()});
+    }
+
+    for (const auto & subexpr : deferred_subexpressions)
+    {
+        const auto child_start = nodes.size();
+        appendTiCIBooleanNodesToFFI(*subexpr.query, nodes);
+        nodes[subexpr.node_idx].child_start = child_start;
+        nodes[subexpr.node_idx].child_len = nodes.size() - child_start;
+    }
+}
+
 struct TiCIReadTaskPool
 {
 public:
@@ -90,7 +136,7 @@ public:
         std::vector<Int64> sort_column_ids_,
         std::vector<bool> sort_column_asc_,
         UInt64 read_ts_,
-        google::protobuf::RepeatedPtrField<tipb::Expr> match_expr_,
+        const tipb::FTSQueryInfo & fts_query_info_,
         bool is_count,
         const TimezoneInfo & timezone_info_,
         rust::Box<ShardsSnapshot> shards_snapshot_)
@@ -103,6 +149,7 @@ public:
         , sort_column_ids(sort_column_ids_)
         , sort_column_asc(sort_column_asc_)
         , read_ts(read_ts_)
+        , with_score(fts_query_info_.query_type() == tipb::FTSQueryTypeWithScore)
         , is_count(is_count)
         , shards_snapshot(std::make_shared<rust::Box<ShardsSnapshot>>(std::move(shards_snapshot_)))
     {
@@ -116,9 +163,15 @@ public:
             return_columns.end(),
             [](const auto & nt, FmtBuffer & fb) { fb.fmtAppend("{}:{}", nt.name, nt.type->getName()); },
             ", ");
-        auto [expr, cids] = tipbToTiCIExpr(match_expr_, timezone_info_);
-        match_expr = std::move(expr);
-        LOG_DEBUG(log, "columns: [{}], match columns: {}", buf.toString(), cids);
+        auto [query, cids] = tipbToTiCISearchQuery(fts_query_info_, timezone_info_);
+        search_query = std::move(query);
+        LOG_DEBUG(
+            log,
+            "columns: [{}], match columns: {}, has_boolean_query={}, with_score={}",
+            buf.toString(),
+            cids,
+            fts_query_info_.has_boolean_query(),
+            with_score);
     }
 
     TiCIReadTaskPtr getNextTask()
@@ -147,7 +200,8 @@ public:
                 sort_column_ids,
                 sort_column_asc,
                 read_ts,
-                match_expr,
+                search_query,
+                with_score,
                 is_count,
                 shards_snapshot);
         }
@@ -167,9 +221,36 @@ private:
     std::vector<Int64> sort_column_ids;
     std::vector<bool> sort_column_asc;
     UInt64 read_ts;
-    ::Expr match_expr;
+    ::SearchQuery search_query;
+    bool with_score;
     bool is_count;
     std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot;
+
+    static std::tuple<::SearchQuery, std::vector<ColumnID>> tipbToTiCISearchQuery(
+        const tipb::FTSQueryInfo & fts_query_info,
+        const TimezoneInfo & timezone_info)
+    {
+        ::SearchQuery ret;
+        std::vector<ColumnID> cids;
+        if (!fts_query_info.match_expr().empty())
+        {
+            auto [expr, expr_cids] = tipbToTiCIExpr(fts_query_info.match_expr(), timezone_info);
+            ret.has_match_expr = true;
+            ret.match_expr = std::move(expr);
+            cids.insert(cids.end(), expr_cids.begin(), expr_cids.end());
+        }
+        if (fts_query_info.has_boolean_query())
+        {
+            ret.boolean_root_len = fts_query_info.boolean_query().nodes_size();
+            appendTiCIBooleanNodesToFFI(fts_query_info.boolean_query(), ret.boolean_query_nodes);
+        }
+        for (const auto & column : fts_query_info.columns())
+        {
+            ret.query_column_ids.push_back(column.column_id());
+            cids.push_back(column.column_id());
+        }
+        return {std::move(ret), cids};
+    }
 
     static std::tuple<::Expr, std::vector<ColumnID>> tipbToTiCIExpr(
         const tipb::Expr & expr,
