@@ -72,7 +72,6 @@ public:
         std::vector<bool> sort_column_asc_,
         UInt64 read_ts_,
         ::SearchQuery search_query_,
-        bool with_score_,
         bool is_count,
         std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot_)
         : log(log_)
@@ -86,7 +85,6 @@ public:
         , sort_column_asc(sort_column_asc_)
         , read_ts(read_ts_)
         , search_query(search_query_)
-        , with_score(with_score_)
         , is_count(is_count)
         , shards_snapshot(std::move(shards_snapshot_))
     {}
@@ -129,7 +127,6 @@ protected:
             .limit = static_cast<size_t>(limit),
             .sort_field_names = std::move(tici_sort_column_names),
             .is_asc = std::move(tici_sort_column_asc),
-            .with_score = with_score && !is_count,
         };
         if (is_count)
             return_fields = {};
@@ -296,7 +293,6 @@ private:
     std::vector<bool> sort_column_asc;
     UInt64 read_ts;
     ::SearchQuery search_query;
-    bool with_score;
     bool is_count;
     std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot;
 

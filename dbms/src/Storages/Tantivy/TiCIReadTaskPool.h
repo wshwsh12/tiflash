@@ -39,7 +39,6 @@ public:
         std::vector<bool> sort_column_asc_,
         UInt64 read_ts_,
         ::SearchQuery search_query_,
-        bool with_score_,
         bool is_count,
         const std::shared_ptr<rust::Box<ShardsSnapshot>> & shards_snapshot_)
     {
@@ -55,7 +54,6 @@ public:
             sort_column_asc_,
             read_ts_,
             search_query_,
-            with_score_,
             is_count,
             shards_snapshot_);
     }
@@ -80,7 +78,8 @@ inline void appendTiCIBooleanNodesToFFI(
     const tipb::FTSBooleanQuery & boolean_query,
     rust::Vec<::BooleanQueryNode> & nodes)
 {
-    static constexpr Int32 subexpression_term_type = 3;
+    static constexpr Int32 ffi_term_kind = 1;
+    static constexpr Int32 ffi_group_kind = 2;
     struct DeferredSubExpression
     {
         size_t node_idx;
@@ -95,18 +94,22 @@ inline void appendTiCIBooleanNodesToFFI(
         ::BooleanQueryNode ffi_node;
         ffi_node.occur = static_cast<Int32>(node.occur());
         ffi_node.modifier = static_cast<Int32>(node.modifier());
+        ffi_node.kind = ffi_term_kind;
+        ffi_node.term_type = 0;
+        ffi_node.phrase_distance = 0;
         ffi_node.child_start = 0;
         ffi_node.child_len = 0;
         if (node.has_term())
         {
             ffi_node.term_type = static_cast<Int32>(node.term().term_type());
+            ffi_node.phrase_distance = node.term().phrase_distance();
             for (const auto ch : node.term().text())
                 ffi_node.text.push_back(static_cast<uint8_t>(ch));
             nodes.push_back(std::move(ffi_node));
             continue;
         }
         RUNTIME_CHECK(node.has_sub_expression());
-        ffi_node.term_type = subexpression_term_type;
+        ffi_node.kind = ffi_group_kind;
         nodes.push_back(std::move(ffi_node));
         deferred_subexpressions.push_back(DeferredSubExpression{nodes.size() - 1, &node.sub_expression()});
     }
@@ -149,7 +152,6 @@ public:
         , sort_column_ids(sort_column_ids_)
         , sort_column_asc(sort_column_asc_)
         , read_ts(read_ts_)
-        , with_score(fts_query_info_.query_type() == tipb::FTSQueryTypeWithScore)
         , is_count(is_count)
         , shards_snapshot(std::make_shared<rust::Box<ShardsSnapshot>>(std::move(shards_snapshot_)))
     {
@@ -167,11 +169,11 @@ public:
         search_query = std::move(query);
         LOG_DEBUG(
             log,
-            "columns: [{}], match columns: {}, has_boolean_query={}, with_score={}",
+            "columns: [{}], match columns: {}, match_expr_size={}, has_boolean_query={}",
             buf.toString(),
             cids,
-            fts_query_info_.has_boolean_query(),
-            with_score);
+            fts_query_info_.match_expr_size(),
+            fts_query_info_.has_boolean_query());
     }
 
     TiCIReadTaskPtr getNextTask()
@@ -201,7 +203,6 @@ public:
                 sort_column_asc,
                 read_ts,
                 search_query,
-                with_score,
                 is_count,
                 shards_snapshot);
         }
@@ -222,7 +223,6 @@ private:
     std::vector<bool> sort_column_asc;
     UInt64 read_ts;
     ::SearchQuery search_query;
-    bool with_score;
     bool is_count;
     std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot;
 
@@ -232,12 +232,10 @@ private:
     {
         ::SearchQuery ret;
         std::vector<ColumnID> cids;
-        if (!fts_query_info.match_expr().empty())
+        if (fts_query_info.match_expr_size() > 0)
         {
-            auto [expr, expr_cids] = tipbToTiCIExpr(fts_query_info.match_expr(), timezone_info);
             ret.has_match_expr = true;
-            ret.match_expr = std::move(expr);
-            cids.insert(cids.end(), expr_cids.begin(), expr_cids.end());
+            std::tie(ret.match_expr, cids) = tipbToTiCIExpr(fts_query_info.match_expr(), timezone_info);
         }
         if (fts_query_info.has_boolean_query())
         {
@@ -274,6 +272,7 @@ private:
             case tipb::ScalarFuncSig::FTSMatchWord:
             case tipb::ScalarFuncSig::FTSMatchPrefix:
             case tipb::ScalarFuncSig::FTSMatchPhrase:
+            case tipb::ScalarFuncSig::FTSMatchPhraseDistance:
             case tipb::ScalarFuncSig::LogicalAnd:
             case tipb::ScalarFuncSig::LogicalOr:
             case tipb::ScalarFuncSig::UnaryNotInt:

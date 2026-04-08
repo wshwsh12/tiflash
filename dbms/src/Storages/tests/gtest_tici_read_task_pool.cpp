@@ -58,10 +58,35 @@ TEST(TiCIReadTaskPoolTest, FlattenBooleanQueryKeepsCurrentLevelContiguous)
     DB::TS::appendTiCIBooleanNodesToFFI(info.boolean_query(), nodes);
 
     ASSERT_EQ(nodes.size(), 4);
+    EXPECT_EQ(nodes[0].kind, 2);
+    EXPECT_EQ(nodes[1].kind, 1);
+    EXPECT_EQ(nodes[2].kind, 1);
+    EXPECT_EQ(nodes[3].kind, 1);
     EXPECT_EQ(nodes[0].child_start, 2);
     EXPECT_EQ(nodes[0].child_len, 2);
     EXPECT_EQ(rustBytesToString(nodes[1].text), "baz");
     EXPECT_EQ(rustBytesToString(nodes[2].text), "foo");
     EXPECT_EQ(rustBytesToString(nodes[3].text), "bar");
+}
+
+TEST(TiCIReadTaskPoolTest, FlattenBooleanQueryCarriesPhraseDistance)
+{
+    tipb::FTSQueryInfo info;
+    auto * root = info.mutable_boolean_query();
+
+    auto * phrase = root->add_nodes();
+    phrase->set_occur(tipb::FTSBooleanOccur::FTSBooleanOccurShould);
+    phrase->set_modifier(tipb::FTSBooleanModifier::FTSBooleanModifierNone);
+    phrase->mutable_term()->set_term_type(tipb::FTSBooleanTermType::FTSBooleanTermPhrase);
+    phrase->mutable_term()->set_text("hello world");
+    phrase->mutable_term()->set_phrase_distance(3);
+
+    rust::Vec<::BooleanQueryNode> nodes;
+    DB::TS::appendTiCIBooleanNodesToFFI(info.boolean_query(), nodes);
+
+    ASSERT_EQ(nodes.size(), 1);
+    EXPECT_EQ(nodes[0].kind, 1);
+    EXPECT_EQ(rustBytesToString(nodes[0].text), "hello world");
+    EXPECT_EQ(nodes[0].phrase_distance, 3);
 }
 } // namespace DB::tests

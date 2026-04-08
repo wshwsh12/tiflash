@@ -102,14 +102,15 @@ void PhysicalPlan::buildTiCIScan(const String & executor_id, const tipb::Executo
     TiCIScan tici_scan(executor, executor_id, dagContext());
     LOG_INFO(
         log,
-        "tici scan: keyspace_id={} table_id={} index_id={} limit={} shard_count={} match_expr_size={} query_type={} "
+        "tici scan: keyspace_id={} table_id={} index_id={} limit={} shard_count={} match_expr_size={} boolean_root_len={} query_type={} "
         "start_ts={}",
         tici_scan.getKeyspaceID(),
         tici_scan.getTableId(),
         tici_scan.getIndexId(),
         tici_scan.getLimit(),
         tici_scan.getShardInfos().shard_info_list.size(),
-        tici_scan.getMatchExpr().size(),
+        executor->idx_scan().fts_query_info().match_expr_size(),
+        executor->idx_scan().fts_query_info().has_boolean_query() ? executor->idx_scan().fts_query_info().boolean_query().nodes_size() : 0,
         tipb::FTSQueryType_Name(executor->idx_scan().fts_query_info().query_type()),
         context.getSettingsRef().read_tso);
     pushBack(PhysicalTiCIScan::build(executor_id, log, tici_scan));
