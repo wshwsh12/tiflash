@@ -91,7 +91,7 @@ inline void appendTiCIBooleanNodesToFFI(
 
     for (const auto & node : boolean_query.nodes())
     {
-        ::BooleanQueryNode ffi_node;
+        ::BooleanQueryNode ffi_node{};
         ffi_node.occur = static_cast<Int32>(node.occur());
         ffi_node.modifier = static_cast<Int32>(node.modifier());
         ffi_node.kind = ffi_term_kind;
@@ -230,7 +230,7 @@ private:
         const tipb::FTSQueryInfo & fts_query_info,
         const TimezoneInfo & timezone_info)
     {
-        ::SearchQuery ret;
+        ::SearchQuery ret{};
         std::vector<ColumnID> cids;
         if (fts_query_info.match_expr_size() > 0)
         {
@@ -254,7 +254,7 @@ private:
         const tipb::Expr & expr,
         const TimezoneInfo & timezone_info)
     {
-        ::Expr ret;
+        ::Expr ret{};
         switch (expr.tp())
         {
         case tipb::ExprType::ScalarFunc:
