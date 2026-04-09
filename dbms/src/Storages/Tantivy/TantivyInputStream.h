@@ -15,6 +15,7 @@
 #pragma once
 
 #include <Common/Logger.h>
+#include <Common/TiFlashException.h>
 #include <Core/Block.h>
 #include <Core/NamesAndTypes.h>
 #include <DataStreams/IBlockInputStream.h>
@@ -30,6 +31,8 @@
 #include <fcntl.h>
 #include <fmt/os.h>
 #include <tici-search-lib/src/lib.rs.h>
+
+#include <algorithm>
 
 namespace DB::TS
 {
@@ -50,9 +53,44 @@ class TantivyInputStream : public IProfilingBlockInputStream
 {
     static constexpr auto NAME = "TantivyInputStream";
 
-    static constexpr auto version_column_name = "column_-1024";
-
 public:
+    static constexpr Int64 virtual_score_column_id = -2050;
+    static constexpr auto virtual_score_column_name = "column_-2050";
+    static constexpr auto version_column_name = "column_-1024";
+    static bool hasUnsupportedScoreSort(const std::vector<Int64> & sort_column_ids)
+    {
+        return std::find(sort_column_ids.begin(), sort_column_ids.end(), virtual_score_column_id) != sort_column_ids.end();
+    }
+
+    static void validatePhase1SortColumnsOrThrow(const std::vector<Int64> & sort_column_ids)
+    {
+        if (!hasUnsupportedScoreSort(sort_column_ids))
+            return;
+        throw TiFlashException(
+            "TiCI phase 1 does not support sorting by the virtual fulltext score column -2050",
+            Errors::Coprocessor::Unimplemented);
+    }
+
+#ifdef DBMS_PUBLIC_GTEST
+    static std::vector<String> buildReturnFieldsForTest(const NamesAndTypes & columns)
+    {
+        auto fields = getFields(columns);
+        std::vector<String> names;
+        names.reserve(fields.size());
+        for (auto & field : fields)
+            names.emplace_back(field.c_str());
+        return names;
+    }
+
+    template <typename Documents>
+    static Block fillResultBlockForTest(const NamesAndTypes & return_columns, const Documents & documents)
+    {
+        Block block(return_columns);
+        fillBlockFromDocuments(block, return_columns, documents);
+        return block;
+    }
+#endif
+
     TantivyInputStream(
         LoggerPtr log_,
         UInt32 keyspace_id_,
@@ -154,33 +192,62 @@ protected:
         {
             return res;
         }
-        for (auto & name_and_type : return_columns)
+        fillBlockFromDocuments(res, return_columns, documents);
+        return res;
+    }
+
+private:
+    Block header;
+    bool done = false;
+    LoggerPtr log;
+    UInt32 keyspace_id;
+    Int64 table_id;
+    Int64 index_id;
+    ShardInfo query_shard_info;
+    NamesAndTypes return_columns;
+    UInt64 limit;
+    std::vector<Int64> sort_column_ids;
+    std::vector<bool> sort_column_asc;
+    UInt64 read_ts;
+    ::Expr match_expr;
+    bool is_count;
+    std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot;
+
+    static bool isVirtualScoreColumnName(const String & name) { return name == virtual_score_column_name; }
+
+    template <typename Documents>
+    static void fillBlockFromDocuments(Block & res, const NamesAndTypes & output_columns, const Documents & documents)
+    {
+        for (const auto & name_and_type : output_columns)
         {
+            if (name_and_type.name == version_column_name)
+            {
+                auto col = res.getByName(name_and_type.name).column->assumeMutable();
+                for (const auto & doc : documents)
+                    col->insert(Field(doc.version));
+                continue;
+            }
+            if (isVirtualScoreColumnName(name_and_type.name))
+            {
+                auto col = res.getByName(name_and_type.name).column->assumeMutable();
+                for (const auto & doc : documents)
+                    col->insert(Field(Float64(doc.score)));
+                continue;
+            }
+
             int idx = -1;
-            for (size_t j = 0; j < documents[0].fieldValues.size(); j++)
+            for (size_t j = 0; j < documents[0].fieldValues.size(); ++j)
             {
                 if (documents[0].fieldValues[j].field_name == name_and_type.name)
                 {
-                    idx = j;
+                    idx = static_cast<int>(j);
                     break;
                 }
             }
             if (idx == -1)
             {
-                if (name_and_type.name == version_column_name)
-                {
-                    auto col = res.getByName(name_and_type.name).column->assumeMutable();
-                    for (auto & doc : documents)
-                    {
-                        col->insert(Field(doc.version));
-                    }
-                    continue;
-                }
-                for (size_t j = 0; j < documents.size(); j++)
-                {
-                    // Insert default value for missing fields
+                for (size_t j = 0; j < documents.size(); ++j)
                     res.getByName(name_and_type.name).column->assumeMutable()->insertDefault();
-                }
                 continue;
             }
 
@@ -188,7 +255,7 @@ protected:
             bool has_null = false;
             if (removeNullable(name_and_type.type)->isStringOrFixedString())
             {
-                for (auto & doc : documents)
+                for (const auto & doc : documents)
                 {
                     const auto & field_value = doc.fieldValues[idx];
                     if (field_value.is_null)
@@ -205,7 +272,7 @@ protected:
             }
             if (removeNullable(name_and_type.type)->isInteger())
             {
-                for (auto & doc : documents)
+                for (const auto & doc : documents)
                 {
                     const auto & field_value = doc.fieldValues[idx];
                     if (field_value.is_null)
@@ -221,7 +288,7 @@ protected:
             }
             if (removeNullable(name_and_type.type)->isDateOrDateTime())
             {
-                for (auto & doc : documents)
+                for (const auto & doc : documents)
                 {
                     const auto & field_value = doc.fieldValues[idx];
                     if (field_value.is_null)
@@ -244,33 +311,23 @@ protected:
                     name_and_type.name);
             }
         }
-        return res;
     }
 
-private:
-    Block header;
-    bool done = false;
-    LoggerPtr log;
-    UInt32 keyspace_id;
-    Int64 table_id;
-    Int64 index_id;
-    ShardInfo query_shard_info;
-    NamesAndTypes return_columns;
-    UInt64 limit;
-    std::vector<Int64> sort_column_ids;
-    std::vector<bool> sort_column_asc;
-    UInt64 read_ts;
-    ::Expr match_expr;
-    bool is_count;
-    std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot;
-
-    static rust::Vec<rust::String> getFields(NamesAndTypes & columns)
+    static rust::Vec<rust::String> getFields(const NamesAndTypes & columns)
     {
         rust::Vec<rust::String> fields;
-        for (auto & name_and_type : columns)
+        bool requested_virtual_score = false;
+        for (const auto & name_and_type : columns)
         {
+            if (isVirtualScoreColumnName(name_and_type.name))
+            {
+                requested_virtual_score = true;
+                continue;
+            }
             fields.push_back(name_and_type.name);
         }
+        if (fields.empty() && requested_virtual_score)
+            fields.push_back(version_column_name);
         return fields;
     }
 

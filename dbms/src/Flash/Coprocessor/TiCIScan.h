@@ -45,6 +45,8 @@ public:
         return tici_scan->idx_scan().fts_query_info().match_expr();
     }
 
+    const tipb::FTSQueryInfo & getFTSQueryInfo() const { return tici_scan->idx_scan().fts_query_info(); }
+
     bool isCount() const { return is_count_agg; }
 
     void setIsCountAgg(bool v) { is_count_agg = v; }

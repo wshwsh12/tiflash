@@ -37,13 +37,13 @@
 #include <common/logger_useful.h>
 #include <tici-search-lib/src/lib.rs.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
 
 namespace DB
 {
-
 StorageTantivy::StorageTantivy(Context & context_, const TiCIScan & tici_scan_)
     : tici_scan(tici_scan_)
     , context(context_)
@@ -81,6 +81,8 @@ void StorageTantivy::read(
         return_columns = genNamesAndTypesForTiCI(tici_scan.getReturnColumns(), "column");
     }
 
+    TS::TantivyInputStream::validatePhase1SortColumnsOrThrow(tici_scan.getSortColumnIds());
+
     RUNTIME_CHECK(local_shards_snapshot.has_value());
     auto shards_snapshot = std::move(*local_shards_snapshot);
     local_shards_snapshot.reset();
@@ -96,7 +98,7 @@ void StorageTantivy::read(
         tici_scan.getSortColumnIds(),
         tici_scan.getSortColumnAsc(),
         context.getSettingsRef().read_tso,
-        tici_scan.getMatchExpr(),
+        tici_scan.getFTSQueryInfo(),
         tici_scan.isCount(),
         context.getTimezoneInfo(),
         std::move(shards_snapshot));

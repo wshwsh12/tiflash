@@ -14,9 +14,14 @@
 
 #pragma once
 
+#include <Common/TiFlashException.h>
 #include <DataStreams/IBlockInputStream.h>
 #include <Flash/Coprocessor/ShardInfo.h>
 #include <Storages/Tantivy/TantivyInputStream.h>
+#include <tipb/executor.pb.h>
+
+#include <algorithm>
+#include <optional>
 
 namespace DB::TS
 {
@@ -79,6 +84,15 @@ struct TiCIReadTaskPool
 public:
     using TiCIReadTasks = std::vector<std::shared_ptr<TiCIReadTask>>;
 
+#ifdef DBMS_PUBLIC_GTEST
+    static std::tuple<::Expr, std::vector<ColumnID>> buildTiCIExprForTest(
+        const tipb::FTSQueryInfo & fts_query_info,
+        const TimezoneInfo & timezone_info)
+    {
+        return buildTiCIExprFromFTSQueryInfo(fts_query_info, timezone_info);
+    }
+#endif
+
     TiCIReadTaskPool(
         LoggerPtr log_,
         UInt32 keyspace_id_,
@@ -90,7 +104,7 @@ public:
         std::vector<Int64> sort_column_ids_,
         std::vector<bool> sort_column_asc_,
         UInt64 read_ts_,
-        google::protobuf::RepeatedPtrField<tipb::Expr> match_expr_,
+        const tipb::FTSQueryInfo & fts_query_info_,
         bool is_count,
         const TimezoneInfo & timezone_info_,
         rust::Box<ShardsSnapshot> shards_snapshot_)
@@ -116,7 +130,7 @@ public:
             return_columns.end(),
             [](const auto & nt, FmtBuffer & fb) { fb.fmtAppend("{}:{}", nt.name, nt.type->getName()); },
             ", ");
-        auto [expr, cids] = tipbToTiCIExpr(match_expr_, timezone_info_);
+        auto [expr, cids] = buildTiCIExprFromFTSQueryInfo(fts_query_info_, timezone_info_);
         match_expr = std::move(expr);
         LOG_DEBUG(log, "columns: [{}], match columns: {}", buf.toString(), cids);
     }
@@ -170,6 +184,206 @@ private:
     ::Expr match_expr;
     bool is_count;
     std::shared_ptr<rust::Box<ShardsSnapshot>> shards_snapshot;
+
+    static ::Expr makeScalarFuncExpr(tipb::ScalarFuncSig sig, std::vector<::Expr> children)
+    {
+        ::Expr expr;
+        expr.tp = tipb::ExprType::ScalarFunc;
+        expr.sig = sig;
+        for (auto & child : children)
+            expr.children.push_back(std::move(child));
+        return expr;
+    }
+
+    static ::Expr makeStringExpr(const String & value)
+    {
+        ::Expr expr;
+        expr.tp = tipb::ExprType::String;
+        std::copy(value.begin(), value.end(), std::back_inserter(expr.val));
+        return expr;
+    }
+
+    static std::vector<::Expr> queryColumnsToTiCIExprs(
+        const google::protobuf::RepeatedPtrField<tipb::ColumnInfo> & query_columns)
+    {
+        RUNTIME_CHECK_MSG(!query_columns.empty(), "FTS boolean query requires at least one query column");
+        std::vector<::Expr> columns;
+        columns.reserve(query_columns.size());
+        for (const auto & column : query_columns)
+            columns.push_back(makeStringExpr(fmt::format("column_{}", column.column_id())));
+        return columns;
+    }
+
+    static std::vector<ColumnID> queryColumnsToIDs(
+        const google::protobuf::RepeatedPtrField<tipb::ColumnInfo> & query_columns)
+    {
+        std::vector<ColumnID> cids;
+        cids.reserve(query_columns.size());
+        for (const auto & column : query_columns)
+            cids.push_back(column.column_id());
+        return cids;
+    }
+
+    static ::Expr foldBooleanExprs(tipb::ScalarFuncSig sig, std::vector<::Expr> exprs)
+    {
+        RUNTIME_CHECK_MSG(!exprs.empty(), "Boolean query folding requires at least one child");
+        auto ret = std::move(exprs.front());
+        for (size_t i = 1; i < exprs.size(); ++i)
+            ret = makeScalarFuncExpr(sig, {std::move(ret), std::move(exprs[i])});
+        return ret;
+    }
+
+    static ::Expr makeMatchNothingExpr(const google::protobuf::RepeatedPtrField<tipb::ColumnInfo> & query_columns)
+    {
+        auto children = queryColumnsToTiCIExprs(query_columns);
+        children.insert(children.begin(), makeStringExpr(""));
+        return makeScalarFuncExpr(tipb::ScalarFuncSig::FTSMatchWord, std::move(children));
+    }
+
+    static ::Expr buildTiCIBooleanTermExpr(
+        const tipb::FTSBooleanTerm & term,
+        const google::protobuf::RepeatedPtrField<tipb::ColumnInfo> & query_columns)
+    {
+        if (term.phrase_distance() != 0)
+        {
+            throw TiFlashException(
+                "TiCI phase 1 does not support boolean phrase distance",
+                Errors::Coprocessor::Unimplemented);
+        }
+
+        tipb::ScalarFuncSig sig = tipb::ScalarFuncSig::FTSMatchWord;
+        switch (term.term_type())
+        {
+        case tipb::FTSBooleanTermWord:
+            sig = tipb::ScalarFuncSig::FTSMatchWord;
+            break;
+        case tipb::FTSBooleanTermPrefix:
+            sig = tipb::ScalarFuncSig::FTSMatchPrefix;
+            break;
+        case tipb::FTSBooleanTermPhrase:
+            sig = tipb::ScalarFuncSig::FTSMatchPhrase;
+            break;
+        default:
+            throw TiFlashException(
+                fmt::format("Unsupported TiCI boolean term type {}", static_cast<int>(term.term_type())),
+                Errors::Coprocessor::BadRequest);
+        }
+
+        auto children = queryColumnsToTiCIExprs(query_columns);
+        children.insert(children.begin(), makeStringExpr(term.text()));
+        return makeScalarFuncExpr(sig, std::move(children));
+    }
+
+    static ::Expr buildTiCIBooleanQueryExpr(
+        const tipb::FTSBooleanQuery & boolean_query,
+        const google::protobuf::RepeatedPtrField<tipb::ColumnInfo> & query_columns)
+    {
+        std::vector<::Expr> must_exprs;
+        std::vector<::Expr> should_exprs;
+        std::vector<::Expr> must_not_exprs;
+        std::optional<::Expr> first_must_not_positive_expr;
+        must_exprs.reserve(boolean_query.nodes_size());
+        should_exprs.reserve(boolean_query.nodes_size());
+        must_not_exprs.reserve(boolean_query.nodes_size());
+
+        for (const auto & node : boolean_query.nodes())
+        {
+            if (node.modifier() != tipb::FTSBooleanModifierNone)
+            {
+                throw TiFlashException(
+                    fmt::format("TiCI phase 1 does not support boolean modifier {}", static_cast<int>(node.modifier())),
+                    Errors::Coprocessor::Unimplemented);
+            }
+
+            ::Expr child_expr;
+            switch (node.node_case())
+            {
+            case tipb::FTSBooleanNode::kTerm:
+                child_expr = buildTiCIBooleanTermExpr(node.term(), query_columns);
+                break;
+            case tipb::FTSBooleanNode::kSubExpression:
+                child_expr = buildTiCIBooleanQueryExpr(node.sub_expression(), query_columns);
+                break;
+            case tipb::FTSBooleanNode::NODE_NOT_SET:
+                throw TiFlashException("FTSBooleanNode has no payload", Errors::Coprocessor::BadRequest);
+            }
+
+            switch (node.occur())
+            {
+            case tipb::FTSBooleanOccurMust:
+                must_exprs.push_back(std::move(child_expr));
+                break;
+            case tipb::FTSBooleanOccurShould:
+                should_exprs.push_back(std::move(child_expr));
+                break;
+            case tipb::FTSBooleanOccurMustNot:
+                if (!first_must_not_positive_expr.has_value())
+                    first_must_not_positive_expr = child_expr;
+                must_not_exprs.push_back(makeScalarFuncExpr(tipb::ScalarFuncSig::UnaryNotInt, {std::move(child_expr)}));
+                break;
+            default:
+                throw TiFlashException(
+                    fmt::format("Unsupported TiCI boolean occur {}", static_cast<int>(node.occur())),
+                    Errors::Coprocessor::BadRequest);
+            }
+        }
+
+        if (must_exprs.empty() && should_exprs.empty())
+        {
+            if (first_must_not_positive_expr.has_value())
+            {
+                return makeScalarFuncExpr(
+                    tipb::ScalarFuncSig::LogicalAnd,
+                    {std::move(*first_must_not_positive_expr), std::move(must_not_exprs.front())});
+            }
+            return makeMatchNothingExpr(query_columns);
+        }
+
+        std::vector<::Expr> filter_exprs;
+        filter_exprs.reserve(
+            must_exprs.size() + must_not_exprs.size() + ((must_exprs.empty() && !should_exprs.empty()) ? 1 : 0));
+        for (auto & expr : must_exprs)
+            filter_exprs.push_back(std::move(expr));
+        for (auto & expr : must_not_exprs)
+            filter_exprs.push_back(std::move(expr));
+        if (must_exprs.empty() && !should_exprs.empty())
+            filter_exprs.push_back(foldBooleanExprs(tipb::ScalarFuncSig::LogicalOr, std::move(should_exprs)));
+
+        if (filter_exprs.size() == 1)
+            return std::move(filter_exprs.front());
+        return foldBooleanExprs(tipb::ScalarFuncSig::LogicalAnd, std::move(filter_exprs));
+    }
+
+    static std::tuple<::Expr, std::vector<ColumnID>> buildTiCIExprFromFTSQueryInfo(
+        const tipb::FTSQueryInfo & fts_query_info,
+        const TimezoneInfo & timezone_info)
+    {
+        std::optional<::Expr> combined_expr;
+        std::vector<ColumnID> cids;
+
+        if (fts_query_info.has_boolean_query())
+        {
+            combined_expr = buildTiCIBooleanQueryExpr(fts_query_info.boolean_query(), fts_query_info.columns());
+            cids = queryColumnsToIDs(fts_query_info.columns());
+        }
+
+        if (fts_query_info.match_expr_size() > 0)
+        {
+            auto [match_expr, match_cids] = tipbToTiCIExpr(fts_query_info.match_expr(), timezone_info);
+            if (combined_expr.has_value())
+                combined_expr = makeScalarFuncExpr(
+                    tipb::ScalarFuncSig::LogicalAnd,
+                    {std::move(*combined_expr), std::move(match_expr)});
+            else
+                combined_expr = std::move(match_expr);
+            cids.insert(cids.end(), match_cids.begin(), match_cids.end());
+        }
+
+        if (!combined_expr.has_value())
+            throw TiFlashException("Empty TiCI fulltext query", Errors::Coprocessor::BadRequest);
+
+        return {std::move(*combined_expr), std::move(cids)};
+    }
 
     static std::tuple<::Expr, std::vector<ColumnID>> tipbToTiCIExpr(
         const tipb::Expr & expr,
